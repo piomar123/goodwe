@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum, IntEnum
 from typing import Any, Callable, Optional
 
@@ -437,6 +438,19 @@ class Inverter(ABC):
         0% - 89%
         """
         raise NotImplementedError()
+
+    async def get_time(self) -> datetime | None:
+        """Read the inverter's real-time clock."""
+        return await self.read_setting("time")
+
+    async def set_time(self, timestamp: datetime | None = None) -> None:
+        """
+        Set the inverter's real-time clock, to local time now if timestamp is not given.
+
+        Note: the SolarGo app does this itself every time it connects to the
+        inverter, overwriting the clock with the phone's local time.
+        """
+        await self.write_setting("time", timestamp or datetime.now())
 
     @abstractmethod
     def sensors(self) -> tuple[Sensor, ...]:

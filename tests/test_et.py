@@ -296,6 +296,14 @@ class GW10K_ET_Test(EtMock):
         )
         self.assertEqual("f710b090000306160104121e19a961", self.request.hex())
 
+    def test_get_time(self):
+        self.loop.run_until_complete(self.get_time())
+        self.assertEqual("f703b090000337b0", self.request.hex())
+
+    def test_set_time(self):
+        self.loop.run_until_complete(self.set_time(datetime(2022, 1, 4, 18, 30, 25)))
+        self.assertEqual("f710b090000306160104121e19a961", self.request.hex())
+
     def test_get_grid_export_limit(self):
         self.loop.run_until_complete(self.get_grid_export_limit())
         self.assertEqual("f703b996000155ec", self.request.hex())
