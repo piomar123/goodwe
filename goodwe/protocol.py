@@ -102,10 +102,20 @@ class InverterProtocol:
 
 
 class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
+    # Each retry waits longer for the response than the previous attempt
+    # (timeout x 1.5 per retry, at most timeout x 3): a reply that is just
+    # slow is then still caught, instead of being raced by more retries.
+    RETRY_TIMEOUT_GROWTH = 1.5
+    RETRY_TIMEOUT_MAX_FACTOR = 3
+
     def __init__(self, host: str, port: int, comm_addr: int, timeout: int = 1, retries: int = 3):
         super().__init__(host, port, comm_addr, timeout, retries)
         self._transport: asyncio.transports.DatagramTransport | None = None
         self._retry: int = 0
+        self._attempt_timeout: float = timeout
+
+    def _retry_timeout(self, retry: int) -> float:
+        return min(self.timeout * self.RETRY_TIMEOUT_GROWTH ** retry, self.timeout * self.RETRY_TIMEOUT_MAX_FACTOR)
 
     def read_command(self, offset: int, count: int) -> ProtocolCommand:
         """Create read protocol command."""
@@ -140,11 +150,13 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
             logger.debug("Socket closed.")
         self._close_transport()
 
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        """On datagram received"""
+    def _cancel_timer(self) -> None:
         if self._timer:
             self._timer.cancel()
             self._timer = None
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        """On datagram received"""
         try:
             if self._partial_data and self._partial_missing == len(data):
                 logger.debug("Composed fragmented response: %s + %s", self._partial_data.hex(), data.hex())
@@ -153,20 +165,24 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
                 self._partial_missing = 0
             if self.command.validator(data):
                 logger.debug("Received: %s", data.hex())
+                self._cancel_timer()
                 self._retry = 0
                 self.response_future.set_result(data)
             else:
+                # Not the response to this command (e.g. a stray datagram):
+                # keep waiting for the real one until the timeout.
                 logger.debug("Received invalid response: %s", data.hex())
-                asyncio.get_running_loop().call_soon(self._timeout_mechanism)
         except PartialResponseException as ex:
             logger.debug("Received response fragment (%d of %d): %s", ex.length, ex.expected, data.hex())
             self._partial_data = data
             self._partial_missing = ex.expected - ex.length
-            self._timer = asyncio.get_running_loop().call_later(self.timeout, self._timeout_mechanism)
+            self._cancel_timer()
+            self._timer = asyncio.get_running_loop().call_later(self._attempt_timeout, self._timeout_mechanism)
         except asyncio.InvalidStateError:
             logger.debug("Response already handled: %s", data.hex())
         except RequestRejectedException as ex:
             logger.debug("Received exception response: %s", data.hex())
+            self._cancel_timer()
             if self.response_future and not self.response_future.done():
                 self.response_future.set_exception(ex)
             self._close_transport()
@@ -178,7 +194,14 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
         self._close_transport()
 
     async def send_request(self, command: ProtocolCommand) -> Future:
-        """Send message via transport"""
+        """Send message via transport.
+
+        Retries are sent from the same socket, so a response to an earlier
+        attempt that arrives late still answers the request. The socket is
+        closed afterwards unless keep_alive is set - and also then if the
+        request needed a retry: a late duplicate response must never reach
+        the next request (a Modbus RTU read response doesn't say which
+        registers it holds)."""
         async with self._ensure_lock():
             retry = 0
             try:
@@ -193,12 +216,11 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
                     except asyncio.CancelledError:
                         if retry < self.retries:
                             retry += 1
-                            if not self.keep_alive:
-                                self._close_transport()
                             continue
                         return self._max_retries_reached()
             finally:
-                if not self.keep_alive:
+                self._cancel_timer()
+                if not self.keep_alive or retry > 0:
                     self._close_transport()
 
     def _send_request(self, command: ProtocolCommand, response_future: Future) -> None:
@@ -208,12 +230,14 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
         self._partial_data = None
         self._partial_missing = 0
         payload = command.request_bytes()
+        self._attempt_timeout = self._retry_timeout(self._retry)
         if self._retry > 0:
             logger.debug("Sending: %s - retry #%s/%s", self.command, self._retry, self.retries)
         else:
             logger.debug("Sending: %s", self.command)
         self._transport.sendto(payload)
-        self._timer = asyncio.get_running_loop().call_later(self.timeout, self._timeout_mechanism)
+        self._cancel_timer()
+        self._timer = asyncio.get_running_loop().call_later(self._attempt_timeout, self._timeout_mechanism)
 
     def _timeout_mechanism(self) -> None:
         """Timeout mechanism to prevent hanging transport"""
@@ -222,7 +246,8 @@ class UdpInverterProtocol(InverterProtocol, asyncio.DatagramProtocol):
             self._retry = 0
         else:
             if self._timer:
-                logger.debug("Failed to receive response to %s in time (%ds).", self.command, self.timeout)
+                logger.debug("Failed to receive response to %s in time (%.2fs).", self.command,
+                             self._attempt_timeout)
                 self._timer = None
             if self.response_future and not self.response_future.done():
                 self.response_future.cancel()
