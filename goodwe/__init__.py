@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from .alarm import AlarmRecord
 from .const import GOODWE_UDP_PORT
 from .dt import DT
 from .es import ES

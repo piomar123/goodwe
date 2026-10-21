@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .const import GOODWE_UDP_PORT
 from .exceptions import MaxRetriesException, RequestFailedException
@@ -17,6 +17,9 @@ from .protocol import (
     TcpInverterProtocol,
     UdpInverterProtocol,
 )
+
+if TYPE_CHECKING:
+    from .alarm import AlarmRecord
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +291,13 @@ class Inverter(ABC):
         """
         Request the device information from the inverter.
         The inverter instance variables will be loaded with relevant data.
+        """
+        raise NotImplementedError()
+
+    async def read_alarms(self, limit: int | None = None) -> list[AlarmRecord]:
+        """
+        Request the alarm (event) log from the inverter.
+        Answer list of records sorted from the newest, at most limit records if specified.
         """
         raise NotImplementedError()
 

@@ -62,6 +62,15 @@ WORK_MODES_ET: dict[int, str] = {
     5: "Check Mode",
 }
 
+# Alarm log record types (as labelled by the SolarGo app, type 2 is not displayed there).
+# Type 2 records mirror the warning_code register (35185), bit meanings unknown.
+ALARM_TYPES_ET: dict[int, str] = {
+    1: "Error Message",
+    2: "Warning",
+    3: "BMS Alarm",
+    4: "BMS Warning",
+}
+
 WORK_MODES_ES: dict[int, str] = {
     0: "Inverter Off - Standby",
     1: "Inverter On",

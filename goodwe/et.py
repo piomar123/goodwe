@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from .alarm import AlarmRecord
 from .const import *
 from .exceptions import RequestFailedException, RequestRejectedException
 from .inverter import EMSMode, Inverter, OperationMode, SensorKind as Kind
@@ -712,6 +713,7 @@ class ET(Inverter):
         self._READ_BATTERY2_INFO: ProtocolCommand = self._read_command(0x9858, 0x0016)
         self._READ_BATTERY2_INFO_EXTENDED = self._read_command(0x89BE, 0x06)
         self._READ_MPPT_DATA: ProtocolCommand = self._read_command(0x89E5, 0x3D)
+        self._READ_ALARM_PAGE: ProtocolCommand = self._read_command(55000, 67)
         self._has_eco_mode_v2: bool = True
         self._has_peak_shaving: bool = True
         self._has_battery: bool = True
@@ -997,6 +999,46 @@ class ET(Inverter):
                 logger.exception("Error reading setting %s.", setting.id_)
                 data[setting.id_] = None
         return data
+
+    async def read_alarms(self, limit: int | None = None) -> list[AlarmRecord]:
+        # The alarm log is a ring buffer of pages, 8 records of 16 bytes each.
+        # Register 47016 selects the page to read, registers 55000-55066 hold
+        # [page count][page index][8 records][index of the page with the newest record].
+        response = await self._read_from_socket(self._READ_ALARM_PAGE)
+        data = response.response_data()
+        page_count = int.from_bytes(data[0:2], "big")
+        newest_page = int.from_bytes(data[132:134], "big")
+        records: dict[int, AlarmRecord] = {}
+        previous_min_id: int | None = None
+        for i in range(page_count):
+            page = (newest_page - i) % page_count
+            await self._read_from_socket(self._write_command(47016, page))
+            response = await self._read_from_socket(self._READ_ALARM_PAGE)
+            data = response.response_data()
+            if int.from_bytes(data[2:4], "big") != page:
+                raise RequestFailedException(
+                    f"Alarm log page {int.from_bytes(data[2:4], 'big')} received, expected {page}"
+                )
+            page_records = [
+                r
+                for r in (
+                    AlarmRecord.from_et_bytes(data[4 + j * 16 : 20 + j * 16])
+                    for j in range(8)
+                )
+                if r
+            ]
+            # stop at an empty page or once the ring buffer wrapped around
+            if not page_records or (
+                previous_min_id is not None
+                and max(r.id for r in page_records) >= previous_min_id
+            ):
+                break
+            records.update({r.id: r for r in page_records})
+            previous_min_id = min(r.id for r in page_records)
+            if limit and len(records) >= limit:
+                break
+        result = sorted(records.values(), key=lambda r: r.id, reverse=True)
+        return result[:limit] if limit else result
 
     async def get_grid_export_limit(self) -> int:
         return await self.read_setting("grid_export_limit")

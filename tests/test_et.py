@@ -5,8 +5,9 @@ from unittest import TestCase
 
 from goodwe.et import ET
 from goodwe.exceptions import RequestRejectedException, RequestFailedException
+from goodwe.alarm import AlarmRecord
 from goodwe.inverter import OperationMode
-from goodwe.modbus import ILLEGAL_DATA_ADDRESS
+from goodwe.modbus import ILLEGAL_DATA_ADDRESS, _modbus_checksum
 from goodwe.protocol import ModbusRtuReadCommand, ProtocolCommand, ProtocolResponse
 
 
@@ -1743,3 +1744,130 @@ class GW5K_BT_Test(EtMock):
         self.assertEqual(147, self.arm_svn_version)
         self.assertEqual("04029-03-S10", self.firmware)
         self.assertEqual("02041-11-S00", self.arm_firmware)
+
+
+class GW8KN_ET_alarms_Test(EtMock):
+    """Alarm log captured from SolarGo talking to a GW8KN-ET (pages 02, 01, 00, 3f)"""
+
+    def __init__(self, methodName="runTest"):
+        EtMock.__init__(self, methodName)
+        self._alarm_page = 0
+        self._alarm_requests = []
+        self._alarm_page_override = None
+
+    async def _read_from_socket(self, command: ProtocolCommand) -> ProtocolResponse:
+        request = command.request.hex()
+        self._alarm_requests.append(request)
+        if request.startswith("f706b7a8"):
+            self._alarm_page = int(request[8:12], 16)
+            return ProtocolResponse(bytes.fromhex("aa55") + command.request, command)
+        root_dir = os.path.dirname(os.path.abspath(__file__))
+        path = f"{root_dir}/sample/et/GW8KN-ET_alarm_page_{self._alarm_page:02x}.hex"
+        if not os.path.exists(path):
+            path = f"{root_dir}/sample/et/GW8KN-ET_alarm_page_1f.hex"
+        with open(path, "r") as f:
+            response = bytearray(bytes.fromhex(f.read()))
+        page = self._alarm_page if self._alarm_page_override is None else self._alarm_page_override
+        response[7:9] = page.to_bytes(2, "big")
+        checksum = _modbus_checksum(response[2:-2])
+        response[-2:] = bytes((checksum & 0xFF, checksum >> 8))
+        response = bytes(response)
+        self.assertTrue(command.validator(response))
+        return ProtocolResponse(response, command)
+
+    def test_read_alarms(self):
+        alarms = self.loop.run_until_complete(self.read_alarms())
+        self.assertEqual(
+            [
+                "f703d6d80043a8de",
+                "f706b7a80002bac9", "f703d6d80043a8de",
+                "f706b7a80001fac8", "f703d6d80043a8de",
+                "f706b7a800003b08", "f703d6d80043a8de",
+                "f706b7a8003f7b18", "f703d6d80043a8de",
+                "f706b7a8003ebad8", "f703d6d80043a8de",
+            ],
+            self._alarm_requests,
+        )
+        self.assertEqual(list(range(531, 503, -1)), [a.id for a in alarms])
+
+        newest = alarms[0]
+        self.assertEqual(datetime(2026, 10, 15, 15, 43, 5), newest.timestamp)
+        self.assertEqual(0, newest.code)
+        self.assertEqual(2, newest.type)
+        self.assertEqual("Warning", newest.type_label)
+        self.assertTrue(newest.hidden)
+
+        warning = alarms[1]
+        self.assertEqual(530, warning.id)
+        self.assertEqual(datetime(2026, 10, 15, 15, 41, 16), warning.timestamp)
+        self.assertEqual(1, warning.code)
+        self.assertEqual("Warning", warning.type_label)
+        self.assertEqual("", warning.description)
+        self.assertTrue(warning.hidden)
+
+        alarm = next(a for a in alarms if a.id == 528)
+        self.assertEqual(datetime(2026, 9, 26, 19, 42, 11), alarm.timestamp)
+        self.assertEqual(537002496, alarm.code)
+        self.assertEqual(1, alarm.type)
+        self.assertEqual("Error Message", alarm.type_label)
+        self.assertEqual(5, alarm.status)
+        self.assertEqual("Check Mode", alarm.status_label)
+        self.assertEqual(33, alarm.temperature)
+        self.assertEqual("Utility Loss, Vac Failure, Fac Failure", alarm.description)
+        self.assertFalse(alarm.hidden)
+
+        alarm = next(a for a in alarms if a.id == 524)
+        self.assertEqual(3, alarm.status)
+        self.assertEqual("Utility Loss, Vac Failure, Back-Up Over Load, Fac Failure", alarm.description)
+
+        alarm = next(a for a in alarms if a.id == 512)
+        self.assertEqual(datetime(2026, 9, 13, 19, 55, 17), alarm.timestamp)
+        self.assertEqual("Normal (Off-Grid)", alarm.status_label)
+        self.assertEqual(31, alarm.temperature)
+
+    def test_read_alarms_limit(self):
+        alarms = self.loop.run_until_complete(self.read_alarms(limit=5))
+        self.assertEqual([531, 530, 529, 528, 527], [a.id for a in alarms])
+        self.assertEqual(5, len(self._alarm_requests))
+
+    def test_read_alarms_wrong_page(self):
+        self._alarm_page_override = 7
+        self.assertRaises(RequestFailedException, self.loop.run_until_complete, self.read_alarms())
+
+    def test_parse_alarm_record_bms_warning(self):
+        alarm = AlarmRecord.from_et_bytes(bytes.fromhex("687e6aaa000000010401ff3101260357"))
+        self.assertEqual(294, alarm.id)
+        self.assertEqual(datetime(2025, 7, 21, 16, 28, 26), alarm.timestamp)
+        self.assertEqual(4, alarm.type)
+        self.assertEqual("BMS Warning", alarm.type_label)
+        self.assertEqual("Normal (On-Grid)", alarm.status_label)
+        self.assertEqual(49, alarm.temperature)
+        self.assertEqual("Charging over-voltage 1", alarm.description)
+        self.assertEqual(0x0357, alarm.unknown)
+        self.assertFalse(alarm.hidden)
+
+    def test_parse_alarm_record_dc_bus_high(self):
+        alarm = AlarmRecord.from_et_bytes(bytes.fromhex("689b0456280208000101ff340187034c"))
+        self.assertEqual(391, alarm.id)
+        self.assertEqual(datetime(2025, 8, 12, 9, 7, 34), alarm.timestamp)
+        self.assertEqual(671221760, alarm.code)
+        self.assertEqual("Error Message", alarm.type_label)
+        self.assertEqual("Normal (On-Grid)", alarm.status_label)
+        self.assertEqual(52, alarm.temperature)
+        self.assertEqual("DC Bus High, Vac Failure, PhaseAngleFailure, Fac Failure", alarm.description)
+        self.assertFalse(alarm.hidden)
+
+    def test_parse_alarm_record_bms_alarm(self):
+        alarm = AlarmRecord.from_et_bytes(bytes.fromhex("68d26a06000010000300ff1a01a20379"))
+        self.assertEqual(418, alarm.id)
+        self.assertEqual(datetime(2025, 9, 23, 9, 36, 6), alarm.timestamp)
+        self.assertEqual(4096, alarm.code)
+        self.assertEqual(3, alarm.type)
+        self.assertEqual("BMS Alarm", alarm.type_label)
+        self.assertEqual("Wait Mode", alarm.status_label)
+        self.assertEqual(26, alarm.temperature)
+        self.assertEqual("Communication failure 2", alarm.description)
+        self.assertFalse(alarm.hidden)
+
+    def test_parse_alarm_record_empty(self):
+        self.assertIsNone(AlarmRecord.from_et_bytes(bytes.fromhex("ff" * 16)))
